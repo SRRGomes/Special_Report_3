@@ -1,15 +1,25 @@
 """
-Approved Facility (AF / 3W / 2W) Analysis — data prep, decision matching, PDF + Excel.
+Approved Facility_(AF_3W_2W)_Analysis - summary script (workflow_v1.txt).
 
-Covers steps 2-7, 11 and 12 of workflow_v1.txt:
-  * read Approval Report HO + Branch (headers/footers skipped), add APPR_SOURCE,
-    concatenate, keep STAT_CON = ACTIVE
-  * credit decision: Credit Score Decision Report (FACNO -> AI_DECISION) first,
-    then RBP Security Approved (FACILITY_NO -> CR_GRADE); DECISION_MATCHED_SRC
-  * Product Category (Auto Finance / 3W / 2W / Other), Product Segment,
-    Customer Type (Existing / New)
-  * PDF + Excel (one sheet per product) into reports/<YYYY-MM-DD>/,
-    used downloads + Preprocessed_All / Preprocessed_AF_3W_2W into reports/<YYYY-MM-DD>/data/
+PERIOD
+  Set by --mode (report_period.py): daily, weekly, cumulative, monthly, past-n-months,
+  custom. Tables are "as at" the last day of the period.
+
+HOW IT WORKS (main() follows these steps)
+  1. Period      start / end dates of the mode
+  2. Inputs      newest Approval Report HO + Branch, Credit Score, RBP, BDO history
+  3. Approvals   HO + Branch combined (headers / footers skipped), APPR_SOURCE added,
+                 only STAT_CON = ACTIVE kept
+  4. Decisions   Credit Score (FACNO -> CR_GRADE) first, then RBP (FACILITY_NO ->
+                 AI_DECISION), else Manual; DECISION_MATCHED_SRC records which
+  5. Categories  Product Category (Auto Finance / 3W / 2W / Other), Product Segment,
+                 Customer Type (Existing / New, from the BDO history)
+  6. Outputs     PDF + Excel (one sheet per product) in reports/<YYYY-MM-DD>/;
+                 Preprocessed_All / Preprocessed_AF_3W_2W and the downloads used in
+                 reports/<YYYY-MM-DD>/data/
+
+This file also holds the shared helpers (file lookup, decision matching, categorisation,
+PDF styles) that the two rental report scripts import.
 
     python approved_facility_summary.py --mode cumulative
     python approved_facility_summary.py --mode past-n-months --n-months 3
@@ -209,8 +219,11 @@ def client_code(series):
     i.e. drop the first 6 and last 6 characters, read the middle as a number
     (leading zeros go). Blank when the number is too short or the middle is not numeric
     (Excel would show #VALUE!).
+    A leading apostrophe (Excel text marker; present in the Approval, Branch Disbursement
+    Old and Credit Score exports, not in RBP) is removed first, as Excel ignores it too.
     """
-    raw = series.astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    raw = (series.astype(str).str.strip().str.strip("'\"`").str.strip()
+           .str.replace(r"\.0$", "", regex=True))
     n = raw.str.len()
     mid = raw.str.slice(CLIENT_CODE_SKIP_START).where(
         n > CLIENT_CODE_SKIP_START + CLIENT_CODE_SKIP_END)
@@ -284,6 +297,18 @@ def is_month_bdo(path):
     return bool(r) and r[0].day == 1 and r[1] == r[0] + pd.offsets.MonthEnd(0)
 
 
+def is_history_bdo(path):
+    """
+    True for a customer-history download: a range of at least HISTORY_MAX_TENOR_MONTHS
+    (one-month rental cohorts and the 12-month Rental Shortfall & 90 DPD activation
+    download are not history). Files without a range in the name are accepted.
+    """
+    r = bdo_file_range(path)
+    if not r:
+        return True
+    return r[1] >= r[0] + pd.DateOffset(months=HISTORY_MAX_TENOR_MONTHS) - pd.Timedelta(days=1)
+
+
 def find_latest(source_key):
     """
     Newest <prefix>*.xlsx, searched in order:
@@ -299,8 +324,8 @@ def find_latest(source_key):
                     + os.sep + f"{prefix}*.xlsx")
     for pattern in patterns:
         files = [Path(f) for f in glob.glob(pattern) if not os.path.basename(f).startswith("~$")]
-        if source_key == "HISTORY":           # never a one-month rental cohort file
-            files = [f for f in files if not is_month_bdo(f)]
+        if source_key == "HISTORY":           # never a cohort / activation-window file
+            files = [f for f in files if is_history_bdo(f)]
         if files:
             found = max(files, key=os.path.getmtime)
             if found.parent != DATA_DIR / subdir:
@@ -472,7 +497,9 @@ def load_decisions(path, key_col, dec_col, mapping, label):
     return d.set_index("_KEY")[[dec_col, "_DEC"]]
 
 
-ALT_KEY_CANDIDATES = ["APPNO"]           # tried only for the diagnostic message
+# App Number exists only in the Approval Reports (not in Credit Score / RBP / Branch
+# Disbursement Old), so it cannot be an alternative join key: no alternative is tried.
+ALT_KEY_CANDIDATES = []
 
 
 def log_match_rate(df, decisions, label, dec_key):
@@ -676,15 +703,19 @@ def classify_customers(active, approvals, history_file, as_at):
 
 
 def prepare(files, as_at):
+    """Steps 3-5: one row per active approved facility with every column the tables need."""
+    # 3. Approvals: HO + Branch, ACTIVE only
     allrows = load_approvals({k: files[k] for k in ("HO", "BRANCH")})
     active = filter_active(allrows)
 
+    # 4. Credit decision: Credit Score first, then RBP, else Manual
     cs = load_decisions(files["CREDIT_SCORE"], CS_KEY, CS_DECISION, CS_DECISION_MAP,
                         "Credit Score Decision Report")
     rbp = load_decisions(files["RBP"], RBP_KEY, RBP_DECISION, RBP_DECISION_MAP,
                          "RBP Security Approved")
     active = match_decisions(active, cs, rbp)
 
+    # 5. Product category / segment and Existing / New customer
     active["PRODUCT_CATEGORY"] = [categorize_product(p, a) for p, a in
                                   zip(active["PRODUCT_NAME"], active["ASSET_DESCR"])]
     active["PRODUCT_SEGMENT"] = [categorize_segment(p, s) for p, s in
@@ -1097,12 +1128,14 @@ def main():
     setup_logging("approved_facility_summary")
     t0 = time.time()
     try:
+        # 1. Period
         start, end = get_period(args.mode, args.n_months)
         label = period_label(start, end)
         mode_text = describe_mode(args.mode, args.n_months)
         period_text = f"Period: {label} ({mode_text})"
         log.info(f"{REPORT_NAME} | mode {args.mode} | {start} to {end}")
 
+        # 2. Input files (newest of each, unless given on the command line)
         files = {
             "HO": args.ho_file or find_latest("HO"),
             "BRANCH": args.branch_file or find_latest("BRANCH"),
@@ -1125,11 +1158,13 @@ def main():
             log.info(f"Input {k:<12}: {Path(f).name} (modified {mtime}, "
                      f"{os.path.getsize(f):,} bytes)")
 
+        # 3-5. Approvals, decisions, categories
         active, target = prepare(files, end)
         if target.empty:
             log.warning("No Auto Finance / 3W / 2W facilities in the data; tables will be empty.")
         log_product_totals(target)
 
+        # 6. Outputs: preprocessed data, PDF, Excel; then move the downloads used
         out_dir = REPORTS_DIR / datetime.now().strftime("%Y-%m-%d")
         out_data = out_dir / "data"
         out_data.mkdir(parents=True, exist_ok=True)
@@ -1154,7 +1189,7 @@ def main():
             log.info("--no-move: input files left in place")
         log.info(f"===== {REPORT_NAME} completed in {time.time() - t0:.1f}s =====")
 
-        # Machine-readable lines parsed by main_orchestrator.py
+        # Lines read by main_orchestrator.py
         print(f"RECORDS : {len(target)}")
         print(f"AMOUNT  : {target[AMOUNT_COL].sum():.2f}")
         print(f"PERIOD  : {label}")

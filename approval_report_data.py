@@ -1,11 +1,20 @@
 """
-Approval Report downloader (Oracle BI, pyautogui/Firefox) — HO and Branch in one script.
+Approval Report downloader (Oracle BI, pyautogui/Firefox) - HO and Branch in one script.
+Used by the Approved Facility report.
+
+HOW IT WORKS (run_process() follows these steps; each screen element is found by its
+image in img/, so the screen must look like it did when the images were captured -
+see check_images.py)
+  1. Dates       period of REPORT_MODE (report_period.py) in Oracle BI format MM-DD-YYYY
+  2. Firefox     open the Oracle BI login page, dismiss the update dialog, sign in
+  3. Report      search the catalog, open the report, pick HO or BRANCHES
+  4. Filters     type the From / To dates, Apply
+  5. Download    export to Excel, wait for the file in Downloads
+  6. Save        move it to data/APPROVAL_REPORT_data_<HO|BRANCH>/APPROVAL_REPORT_<X>_<stamp>.xlsx
+  main() retries the whole process up to 3 times (screenshot + browser closed after a failure).
 
     python approval_report_data.py --type HO
     python approval_report_data.py --type BRANCHES
-
-Saves to BASE_DIR/data/APPROVAL_REPORT_data_<HO|BRANCH>/APPROVAL_REPORT_<HO|BRANCH>_<stamp>.xlsx.
-Reporting period comes from report_period (REPORT_MODE / REPORT_N_MONTHS env vars).
 """
 import sys
 import argparse

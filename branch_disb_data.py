@@ -1,6 +1,18 @@
 """
-BRANCH DISBURSEMENT OLD downloader (Oracle BI, pyautogui/Firefox) - customer history
-for the Existing / New Customer check of the Approved Facility (AF / 3W / 2W) Analysis.
+BRANCH DISBURSEMENT OLD downloader (Oracle BI, pyautogui/Firefox). Used by all three
+reports: as customer history (Existing / New check) and, with a fixed range, as the
+activation list of the rental reports.
+
+HOW IT WORKS (run_process() follows these steps; screen elements are found by their
+images in img/branch_disb - see check_images.py if they are not found on a new PC)
+  1. Dates       history_range(): the given --from-date/--to-date, or the history range below
+  2. Firefox     open the Oracle BI login page, dismiss dialogs, sign in
+  3. Report      search the catalog, open BRANCH DISBURSEMENT OLD
+  4. Filters     type the From / To dates, Apply
+  5. Download    export to Excel, wait for the file in Downloads
+  6. Save        move it to data/BRANCH_DISB_OLD_data/BRANCH DISBURSEMENT OLD_<from>_to_<to>_<stamp>.xlsx
+                 (the summaries tell files apart by this date range)
+  main() retries the whole process up to 3 times.
 
 The report lists facilities DISBURSED between From and To (with NIC_NO, FACNO,
 CLOSURE_DATE). To see every facility that could be active in the look-back window,
@@ -453,9 +465,10 @@ def run_process(from_date=None, to_date=None):
     from_date = first_day.strftime("%m-%d-%Y")       # Oracle BI prompt format
     to_date = last_day.strftime("%m-%d-%Y")
 
+    basis = ("given range" if from_date else
+             f"look-back {EXISTING_LOOKBACK_MONTHS}m + max tenor {HISTORY_MAX_TENOR_MONTHS}m")
     log.info(f"Report: {REPORT_PREFIX} | mode {get_mode()} | disbursed {first_day:%d-%b-%Y} "
-             f"to {last_day:%d-%b-%Y} (look-back {EXISTING_LOOKBACK_MONTHS}m + "
-             f"max tenor {HISTORY_MAX_TENOR_MONTHS}m)")
+             f"to {last_day:%d-%b-%Y} ({basis})")
     log.info(f"From date: {from_date} | To date: {to_date}")
 
     # --------------------------------------------------------
@@ -625,12 +638,12 @@ def main():
             success = True
             log.info(f"Report saved at: {destination}")
             break
-    
+
         except Exception as exc:
             log.error(f"Attempt {attempt} failed: {exc}", exc_info=True)
             take_screenshot(attempt)
             close_browser()
-    
+
             if attempt < MAX_ATTEMPTS:
                 log.info("Retrying in 5 seconds...")
                 time.sleep(5)

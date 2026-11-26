@@ -2,7 +2,7 @@ import schedule
 import time
 import subprocess
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Log file path
 LOG_FILE = "scheduler_logs.txt"
@@ -13,12 +13,13 @@ def log_message(message):
         f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
     print(message)
 
-def run_program(program_path, working_dir):
-    """Run python program from a specific directory"""
+def run_program(program_path, working_dir, args=None):
+    """Run python program from a specific directory (optional command-line args)"""
+    args = args or []
     try:
-        log_message(f"Starting {program_path} in {working_dir}")
+        log_message(f"Starting {program_path} {' '.join(args)} in {working_dir}")
         result = subprocess.run(
-            ["python", program_path],
+            ["python", program_path, *args],
             cwd=working_dir,
             capture_output=True,
             text=True
@@ -174,6 +175,21 @@ programs = {
     "Special_Report":{
         "path": "main_orchestrator.py",
         "dir" : r"C:\Users\sachintha.fernando\Documents\Report_Automation\Special_Report_Mr_Dave"
+    },
+    # Rental reports + data-request alert: deployed in Special_Report_Mr_Dave_3
+    "Rental_Shortfall_Report":{
+        "path": "main_orchestrator.py",
+        "args": ["--report", "rental-shortfall"],
+        "dir" : r"C:\Users\sachintha.fernando\Documents\Report_Automation\Special_Report_Mr_Dave_3"
+    },
+    "Rental_Shortfall_90DPD_Analysis":{
+        "path": "main_orchestrator.py",
+        "args": ["--report", "rental-dpd"],
+        "dir" : r"C:\Users\sachintha.fernando\Documents\Report_Automation\Special_Report_Mr_Dave_3"
+    },
+    "Data_Request_Alert":{
+        "path": "data_request_alert.py",
+        "dir" : r"C:\Users\sachintha.fernando\Documents\Report_Automation\Special_Report_Mr_Dave_3"
     }
 }
 
@@ -358,6 +374,25 @@ def schedule_Special_Report():
     if current_datetime.weekday() <= 6:
         run_program(programs["Special_Report"]["path"], programs["Special_Report"]["dir"])
 
+# Rental Shortfall Report: last day of the month (as at that day)
+def schedule_Rental_Shortfall_Report():
+    tomorrow = datetime.today() + timedelta(days=1)
+    if tomorrow.day == 1:  # today is the last day of the month
+        p = programs["Rental_Shortfall_Report"]
+        run_program(p["path"], p["dir"], p["args"])
+
+# Rental Shortfall & 90 DPD Analysis: 1st of the month (as at the 1st, previous month's data)
+def schedule_Rental_Shortfall_90DPD_Analysis():
+    if datetime.today().day == 1:
+        p = programs["Rental_Shortfall_90DPD_Analysis"]
+        run_program(p["path"], p["dir"], p["args"])
+
+# Data-request alert to DATA_PROVIDER: checked daily; the script itself sends only
+# 2 days before each rental report (2 days before month-end / 2 days before the 1st)
+def schedule_Data_Request_Alert():
+    p = programs["Data_Request_Alert"]
+    run_program(p["path"], p["dir"])
+
 # === Daily schedules ===
 # Uncomment if needed: schedule.every().day.at("07:58").do(schedule_Decision_Pending)
 # schedule.every().day.at("03:00").do(schedule_CED_Performance_monthly)
@@ -388,6 +423,9 @@ schedule.every().day.at("10:15").do(schedule_Vehicle_Loan_Initiation_Report)
 schedule.every().day.at("10:30").do(schedule_3W_Auto_Finance_Report)
 schedule.every().day.at("14:00").do(schedule_Fraud_Incident_Register_Report)
 schedule.every().day.at("16:30").do(schedule_evening_status_report)
+schedule.every().day.at("08:45").do(schedule_Data_Request_Alert)
+schedule.every().day.at("22:00").do(schedule_Rental_Shortfall_Report)        # runs only on the last day
+schedule.every().day.at("22:00").do(schedule_Rental_Shortfall_90DPD_Analysis) # runs only on the 1st
 # schedule.every().day.at("16:30").do(schedule_Decision_Pending_4pm) # Uncomment if needed: 
 # schedule.every().day.at("17:10").do(schedule_RBP_5_10_PM_Report) # Served for testing:  
 

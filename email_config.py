@@ -9,6 +9,7 @@ from reports/<YYYY-MM-DD>/:
     python email_config.py --mode daily --dry-run          # show what would be sent
     python email_config.py --mode custom --from-date 2026-10-01 --to-date 2026-10-31
     python email_config.py --report rental-shortfall --dry-run   # latest Rental Shortfall Report
+    python email_config.py --report rental-dpd --dry-run         # latest Rental Shortfall & 90 DPD Analysis
 
 credentials.env:
     SMTP_SERVER, SMTP_PORT (25), SMTP_USE_TLS (false), SMTP_USERNAME, SMTP_PASSWORD, EMAIL_FROM
@@ -20,7 +21,9 @@ credentials.env:
         custom         -> CUSTOM_GROUP
         weekly         -> WEEKLY_GROUP   (no group defined yet; set it to email weekly runs)
     Rental Shortfall Report (--report rental-shortfall) -> THREE_MONTHS_RENTAL_ANALYSIS_GROUP
+    Rental Shortfall & 90 DPD Analysis (--report rental-dpd) -> RENTAL_90DPD_ANALYSIS_GROUP
     APPR_AF_ERROR_TO                    optional, failure alerts
+    DATA_PROVIDER                       data-request alerts (data_request_alert.py)
 """
 import os
 import sys
@@ -60,6 +63,8 @@ ERROR_TO_VAR = "APPR_AF_ERROR_TO"
 
 # Rental Shortfall Report: one group, whatever the months
 RENTAL_GROUP = "THREE_MONTHS_RENTAL_ANALYSIS_GROUP"
+# Rental Shortfall & 90 DPD Analysis: one group
+DPD_GROUP = "RENTAL_90DPD_ANALYSIS_GROUP"
 
 
 def _rental():
@@ -67,8 +72,15 @@ def _rental():
     return rss
 
 
+def _dpd():
+    import rental_dpd_summary as rds            # only when that report is emailed
+    return rds
+
+
 def report_names(report):
     """(email subject name, recipient group or None = by mode) for a report."""
+    if report == "rental-dpd":
+        return _dpd().DPD_EMAIL_SUBJECT, DPD_GROUP
     if report == "rental-shortfall":
         return _rental().RENTAL_EMAIL_SUBJECT, RENTAL_GROUP
     return REPORT_NAME, None
@@ -136,7 +148,8 @@ def send_email(subject, html, to, cc=None, attachments=()):
 def report_message(period, mode_text, records=None, amount=None, report="approved-facility"):
     name, _ = report_names(report)
     subject = f"{name} - {period}"
-    what = ("Activated facilities" if report == "rental-shortfall" else "Approved facilities")
+    what = ("Activated facilities" if report in ("rental-shortfall", "rental-dpd")
+            else "Approved facilities")
     stats = ""
     if records is not None and amount is not None:
         stats = (f"<p>{what} (AF, 3W &amp; 2W): <b>{int(float(records)):,}</b> "
@@ -200,23 +213,23 @@ def latest_outputs(mode, n_months, run_date):
     return found[".pdf"], found[".xlsx"], period_label(start, end)
 
 
-def latest_rental_outputs(run_date):
-    """Newest Rental Shortfall Report PDF + Excel in reports/<run_date>/."""
-    rss = _rental()
+def latest_rental_outputs(run_date, report="rental-shortfall"):
+    """Newest Rental Shortfall Report (or Rental Shortfall & 90 DPD Analysis) PDF + Excel."""
+    name = _dpd().DPD_FILE_NAME if report == "rental-dpd" else _rental().RENTAL_FILE_NAME
     folder = REPORTS_DIR / run_date
     found = {}
     for ext in (".pdf", ".xlsx"):
-        files = [Path(f) for f in glob.glob(glob.escape(str(folder / rss.RENTAL_FILE_NAME)) + "_*" + ext)]
+        files = [Path(f) for f in glob.glob(glob.escape(str(folder / name)) + "_*" + ext)]
         if not files:
-            raise FileNotFoundError(f"{rss.RENTAL_FILE_NAME}_*{ext} not found in {folder}")
+            raise FileNotFoundError(f"{name}_*{ext} not found in {folder}")
         found[ext] = max(files, key=os.path.getmtime)
-    period = found[".pdf"].stem[len(rss.RENTAL_FILE_NAME) + 1:].replace("_", " ")
+    period = found[".pdf"].stem[len(name) + 1:].replace("_", " ")
     return found[".pdf"], found[".xlsx"], period
 
 
 def main():
     ap = argparse.ArgumentParser(description=f"Email the {REPORT_NAME} or Rental Shortfall Report")
-    ap.add_argument("--report", choices=("approved-facility", "rental-shortfall"),
+    ap.add_argument("--report", choices=("approved-facility", "rental-shortfall", "rental-dpd"),
                     default="approved-facility")
     ap.add_argument("--mode", choices=MODES, default="cumulative")
     ap.add_argument("--n-months", type=int, default=3)
@@ -225,13 +238,14 @@ def main():
                     help="run date folder reports/<YYYY-MM-DD> (default: today)")
     ap.add_argument("--dry-run", action="store_true", help="print, do not send")
     args = ap.parse_args()
-    if args.report == "rental-shortfall":
+    if args.report in ("rental-shortfall", "rental-dpd"):
         setup_logging("email_config")
         try:
-            pdf, excel, period = latest_rental_outputs(args.date)
+            pdf, excel, period = latest_rental_outputs(args.date, args.report)
             log.info(f"Latest outputs in reports/{args.date}: {pdf.name}, {excel.name}")
-            send_report(pdf, excel, period, "rental-shortfall", "3 months", dry_run=args.dry_run,
-                        report="rental-shortfall")
+            send_report(pdf, excel, period, args.report,
+                        "3 months" if args.report == "rental-shortfall" else "12 months activation",
+                        dry_run=args.dry_run, report=args.report)
         except Exception as e:
             log.error(f"Email failed: {e}", exc_info=True)
             sys.exit(1)

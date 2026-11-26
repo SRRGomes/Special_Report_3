@@ -1,25 +1,25 @@
 """
-Rental Shortfall Report (AF / 3W / 2W) — workflow_v2.txt.
+Rental Shortfall Report (AF / 3W / 2W) - workflow_v2.txt.
 
-For a run in month M the report covers the 3 calendar months before M (e.g. November ->
-Aug, Sep, Oct), taken from the LENDING portfolio files:
+AS-AT DATE
+  Runs on the last day of each month. The report covers the run month and the 2 months
+  before it, "as at" the last day of the latest LENDING month (= the run day).
+  Run 31 Oct 2026 -> months Aug, Sep, Oct 2026, "as at 31st October 2026".
+  (The Rental Shortfall & 90 DPD Analysis instead is "as at the 1st of the next month".)
 
-  * data/LENDING_data/*.csv          monthly portfolios; month from MONTHEND
-                                     (header row = the row with MONTHEND and NEW_CONNO)
-  * BRANCH DISBURSEMENT OLD, one download per month = facilities disbursed that month
-    (the activation cohort), merged with THE SAME MONTH's portfolio on NEW_CONNO = FACNO:
-    COLLECTION_FOR_THE_MONTH, DUE_FOR_THE_MONTH, GROSS_RENTAL
-  * credit decision: Credit Score Decision Report, then RBP Security Approved (as before)
-  * Product Category / Segment: proudct_categorization_v2.txt (same rules as before)
-  * Customer type: customer_categorization_v2.txt
-        Existing if the customer (client code from the facility number)
-          has another facility active as at the report's as-at date (last MONTHEND), OR
-          had another facility active in the 12 months before this facility's CONEX_DATE
-        else New
-  * per product / customer type / segment / decision / activation month:
-        No. = number of facilities, Value = sum of LEASE_AMOUNT,
-        Collection Ratio = sum COLLECTION_FOR_THE_MONTH / sum DUE_FOR_THE_MONTH
-  * PDF (one page per product) + Excel (one sheet per product) in reports/<YYYY-MM-DD>/
+HOW IT WORKS (main() follows these steps)
+  1. LENDING     monthly portfolio csvs in data/LENDING_data (header = the row with MONTHEND
+                 and NEW_CONNO); the latest 3 months found set the report months
+  2. Inputs      Credit Score + RBP decisions, BDO history (Existing/New), and one
+                 BRANCH DISBURSEMENT OLD per month (else that month from the history file)
+  3. Cohorts     facilities disbursed in each month (= activation month)
+  4. Decisions   Credit Score first, then RBP, else Manual
+  5. Categories  Product (AF / 3W / 2W), segment, Existing / New (v2 rule, as at the last day)
+  6. LENDING     merge each cohort with THE SAME MONTH's portfolio (NEW_CONNO = FACNO)
+  7. Metrics     per product / customer type / segment / decision and month:
+                   No. = facilities, Value = sum LEASE_AMOUNT,
+                   Collection Ratio = sum COLLECTION_FOR_THE_MONTH / sum DUE_FOR_THE_MONTH
+  8. Outputs     PDF (one page per product) + Excel (one sheet per product) in reports/<date>/
 
     python rental_shortfall_summary.py
     python rental_shortfall_summary.py --lending-dir "D:/LENDING_data" --no-move
@@ -72,7 +72,7 @@ RENTAL_FILE_NAME = "Rental Shortfall Report"
 # CONFIGURATION
 # ============================================================
 LENDING_DIR = DATA_DIR / "LENDING_data"
-LENDING_MONTHS = 3                      # portfolios = 3 calendar months before the run month
+LENDING_MONTHS = 3                      # the latest 3 LENDING months found (run month + 2 before)
 LENDING_KEY = "NEW_CONNO"               # facility number in the portfolio files
 MONTHEND_COL = "MONTHEND"
 COLLECTION_COL = "COLLECTION_FOR_THE_MONTH"
@@ -94,6 +94,14 @@ RENTAL_TEMPLATE_SEGMENTS = {
     "Existing Customers": ["HP/Lease", "Smart Draft", "Enhancement", "Pledge Loan"],
 }
 RENTAL_DEFAULT_SEGMENTS = ["HP/Lease"]   # New Customers (and N/A)
+
+
+def customer_rule_text(as_at):
+    """v2 Existing/New rule, worded as tests A and B (PDF note and Excel sheets)."""
+    return (f"Existing Customer if another facility of the same client code passes A or B "
+            f"(else New). A: open on the as-at date ({ordinal_date(as_at)}). "
+            f"B: disbursed before this facility's CONEX_DATE and open at some point in the "
+            f"{RENTAL_LOOKBACK_MONTHS} months before it.")
 
 # ============================================================
 # LENDING PORTFOLIOS
@@ -204,8 +212,11 @@ def _bdo_files():
     return [f for f in files if not f.name.startswith("~$")]
 
 
-def find_cohort_files(months):
-    """Newest one-month BRANCH DISBURSEMENT OLD file for each month."""
+def find_cohort_files(months, history_file=None):
+    """
+    Newest one-month BRANCH DISBURSEMENT OLD file for each month. A month without one
+    falls back to history_file (facilities with CONEX_DATE in that month), if given.
+    """
     by_month = {}
     for f in _bdo_files():
         if is_month_bdo(f):
@@ -213,6 +224,12 @@ def find_cohort_files(months):
             if m in months and (m not in by_month or f.stat().st_mtime > by_month[m].stat().st_mtime):
                 by_month[m] = f
     missing = [str(m) for m in months if m not in by_month]
+    if missing and history_file:
+        log.warning(f"No one-month {BDO_PREFIX} file for {missing}; taking those months' "
+                    f"activations from {Path(history_file).name} ({BDO_START_COL} in the month)")
+        for m in months:
+            by_month.setdefault(m, Path(history_file))
+        return by_month
     if missing:
         raise FileNotFoundError(
             f"No one-month {BDO_PREFIX} file for {missing} (name must contain "
@@ -223,9 +240,11 @@ def find_cohort_files(months):
 
 def load_cohorts(cohort_files):
     """Facilities disbursed in each month; _MONTH = activation (cohort) month."""
-    frames = []
+    frames, cache = [], {}
     for month, path in sorted(cohort_files.items()):
-        d = read_report_excel(path, BDO_KEY)
+        if path not in cache:
+            cache[path] = read_report_excel(path, BDO_KEY)
+        d = cache[path].copy()
         require_cols(d, [BDO_AMOUNT_COL, "PRODUCT_NAME", "ASSET_DESCR"], f"{BDO_PREFIX} {path.name}")
         if "SCHEME_DESCRIPTION" not in d.columns:
             log.warning(f"{path.name}: SCHEME_DESCRIPTION not found; segments use PRODUCT_NAME only")
@@ -237,6 +256,9 @@ def load_cohorts(cohort_files):
             log.warning(f"{path.name}: {BDO_START_COL} not found; using the 1st of {month}")
             d[BDO_START_COL] = pd.NaT
         outside = d[BDO_START_COL].notna() & (d[BDO_START_COL].dt.to_period("M") != month)
+        if not is_month_bdo(path):              # history fallback: keep this month only
+            d = d[~outside & d[BDO_START_COL].notna()].copy()
+            outside = outside.loc[d.index]
         if outside.any():
             log.warning(f"{path.name}: {int(outside.sum()):,} facility(ies) with {BDO_START_COL} "
                         f"outside {month}; kept in the {month} cohort")
@@ -311,11 +333,16 @@ def classify_customers_v2(df, history_file, as_at):
     in_lookback = ((m["_HSTART"] < m["_CONEX"])
                    & (m["_HCLOSE"].isna() | (m["_HCLOSE"] >= window_start)))
     existing = set(m.loc[active_as_at | in_lookback, "_KEY"])
+    keys_a = set(m.loc[active_as_at, "_KEY"])
+    keys_b = set(m.loc[in_lookback, "_KEY"])
     log.info(f"Existing via 'active as at {as_at:%d-%b-%Y}': "
              f"{m.loc[active_as_at, '_KEY'].nunique():,} | via '{RENTAL_LOOKBACK_MONTHS} months "
              f"before CONEX': {m.loc[in_lookback, '_KEY'].nunique():,} (a facility can be both)")
 
     df["CLIENT_CODE"] = cust.values
+    # Which test made the facility Existing: "A+B", "A", "B" ("" for New / N/A)
+    df["EXISTING_TEST"] = [("A+B" if k in keys_a and k in keys_b else "A" if k in keys_a
+                            else "B" if k in keys_b else "") for k in df["_KEY"]]
     df["CUSTOMER_TYPE"] = "New Customers"
     df.loc[df["_KEY"].isin(existing), "CUSTOMER_TYPE"] = "Existing Customers"
     df.loc[cust.isna().values, "CUSTOMER_TYPE"] = UNCLASSIFIED
@@ -332,14 +359,18 @@ def classify_customers_v2(df, history_file, as_at):
 # ============================================================
 
 def prepare(lending, months, as_at, cohort_files, files):
+    """Steps 3-6: one row per activated facility with every column the tables need."""
+    # 3. Cohorts: facilities disbursed in each month
     df = load_cohorts(cohort_files)
 
+    # 4. Credit decision: Credit Score first, then RBP, else Manual
     cs = load_decisions(files["CREDIT_SCORE"], CS_KEY, CS_DECISION, CS_DECISION_MAP,
                         "Credit Score Decision Report")
     rbp = load_decisions(files["RBP"], RBP_KEY, RBP_DECISION, RBP_DECISION_MAP,
                          "RBP Security Approved")
     df = match_decisions(df, cs, rbp)          # also logs the match rate per report
 
+    # 5. Product category / segment and Existing / New customer
     df["PRODUCT_CATEGORY"] = [categorize_product(p, a) for p, a in
                               zip(df["PRODUCT_NAME"], df["ASSET_DESCR"])]
     df["PRODUCT_SEGMENT"] = [categorize_segment(p, s) for p, s in
@@ -348,7 +379,7 @@ def prepare(lending, months, as_at, cohort_files, files):
 
     df = classify_customers_v2(df, files.get("HISTORY"), as_at)
 
-    # Same month's portfolio: cohort month M <-> LENDING MONTHEND month M
+    # 6. Same month's portfolio: cohort month M <-> LENDING MONTHEND month M
     df = df.merge(lending, how="left", on=["_MONTH", "_KEY"], suffixes=("", "_LENDING"))
     found = df[DUE_COL].notna()
     for month in months:
@@ -444,6 +475,8 @@ def create_excel(target, xlsx_path, months, as_at):
             Font(bold=True, size=14, color="1F3864")
         ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=last_col)
         ws.cell(row=2, column=2, value=subtitle(months)).font = Font(italic=True, color="2E4C7E")
+        ws.cell(row=3, column=2, value=customer_rule_text(as_at)).font = Font(italic=True, size=9,
+                                                                             color="808080")
         ws.merge_cells(start_row=2, start_column=2, end_row=2, end_column=last_col)
 
         # Header rows 4-6
@@ -604,9 +637,7 @@ def create_pdf(target, pdf_path, months, as_at, source_files):
     notes = (f"* No. = number of facilities activated (disbursed) in the month; Value = sum of "
              f"LEASE AMOUNT; Collection Ratio = sum {COLLECTION_COL} / sum {DUE_COL} from that "
              f"month's portfolio. Decision: {CS_DECISION} (Credit Score), else {RBP_DECISION} "
-             f"(RBP), else Manual.<br/>* Existing Customer: same client code has another facility "
-             f"active as at {ordinal_date(as_at)}, or one active in the {RENTAL_LOOKBACK_MONTHS} "
-             f"months before the disbursement date. Source: "
+             f"(RBP), else Manual.<br/>* " + customer_rule_text(as_at) + " Source: "
              f"{', '.join(Path(f).name for f in source_files)}.")
     elements = []
     for i, product in enumerate(PRODUCTS):
@@ -642,28 +673,34 @@ def main():
     setup_logging("rental_shortfall_summary")
     t0 = time.time()
     try:
+        # 1. LENDING: the latest 3 months set the report months and the as-at date
         lending, months, _ = load_lending(Path(args.lending_dir))
-        as_at = months[-1].end_time.normalize()
+        as_at = months[-1].end_time.normalize()               # last day of the latest month
         period = f"{months[0].strftime('%B-%Y')} to {months[-1].strftime('%B-%Y')}"
         log.info(f"{RENTAL_REPORT_TITLE} | months {[str(m) for m in months]} | as at {as_at:%d-%b-%Y}")
 
-        cohort_files = find_cohort_files(months)
+        # 2. Input files (newest of each, unless given on the command line)
         files = {"CREDIT_SCORE": args.cs_file or find_latest("CREDIT_SCORE"),
                  "RBP": args.rbp_file or find_latest("RBP")}
         try:
             files["HISTORY"] = args.history_file or find_latest("HISTORY")
         except FileNotFoundError:
             log.warning(f"No {BDO_PREFIX} history file found")
+        cohort_files = find_cohort_files(months, files.get("HISTORY"))
         for k, f in list(files.items()) + [(f"COHORT {m}", p) for m, p in cohort_files.items()]:
             log.info(f"Input {k:<14}: {Path(f).name}")
 
+        # 3-6. Cohorts, decisions, categories, LENDING merge
         df, target = prepare(lending, months, as_at, cohort_files, files)
+
+        # 7. Metrics (logged per product; the tables are built in step 8)
         for product in PRODUCTS + ["Total"]:
             d = target if product == "Total" else target[target["PRODUCT_CATEGORY"] == product]
             parts = " | ".join(f"{m}: {no:,} / {value:,.0f} / {format_ratio(ratio)}"
                                for m, (no, value, ratio) in zip(months, month_metrics(d, months)))
             log.info(f"Summary {product:<12} (No. / Value / Collection Ratio) {parts}")
 
+        # 8. Outputs: preprocessed data, PDF, Excel; then move the downloads used
         out_dir = REPORTS_DIR / datetime.now().strftime("%Y-%m-%d")
         out_data = out_dir / "data"
         out_data.mkdir(parents=True, exist_ok=True)
@@ -680,10 +717,12 @@ def main():
         create_excel(target, xlsx_path, months, as_at)
 
         if not args.no_move:
-            move_inputs({**files, **{str(m): p for m, p in cohort_files.items()}}, out_data)
+            cohorts_only = {str(m): p for m, p in cohort_files.items()
+                            if Path(p) != Path(files.get("HISTORY", ""))}
+            move_inputs({**files, **cohorts_only}, out_data)
         log.info(f"===== {RENTAL_REPORT_TITLE} completed in {time.time() - t0:.1f}s =====")
 
-        # Machine-readable lines parsed by main_orchestrator.py
+        # Lines read by main_orchestrator.py
         print(f"RECORDS : {len(target)}")
         print(f"AMOUNT  : {target[BDO_AMOUNT_COL].sum():.2f}")
         print(f"PERIOD  : {period}")

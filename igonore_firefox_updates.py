@@ -1,3 +1,17 @@
+"""
+Shared browser helpers for the Oracle BI downloaders (approval_report_data.py,
+branch_disb_data.py) and the ERP downloader.
+
+  find_firefox / open_in_firefox     always open Firefox, never the default browser
+  dismiss_firefox_update_dialog      close the "update Firefox" pop-up if it appears
+  dismiss_save_password_prompt       close the "save password" pop-up
+  oracle_sign_in / oracle_sign_in2   Oracle BI login (skipped if already signed in)
+  search_bar_enter, open_catalog_report, click_field, set_date_field, click_button,
+  click_toolbar_option, handle_report_download
+                                     find a screen element by its image and click / type
+  _wait_for_image                    the image search used by all of them
+                                     (confidence 0.7, grayscale)
+"""
 import os
 import time
 import shutil

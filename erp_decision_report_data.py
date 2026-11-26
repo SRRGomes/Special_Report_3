@@ -4,17 +4,29 @@ Report and Risk-Based Pricing Security Approved in one script.
 
     python erp_decision_report_data.py --report credit-score
     python erp_decision_report_data.py --report rbp
+    python erp_decision_report_data.py --report rbp --lookback-months 5
 
 Saves to BASE_DIR/data/<SUBDIR>/<PREFIX>_<YYYY-MM-DD>.xlsx.
 
 Date range: the reporting period (report_period, REPORT_MODE env var) widened
-back by DECISION_LOOKBACK_MONTHS whole months, because a credit decision is
-usually made weeks before the facility is approved.
-The ERP accepts at most ERP_MAX_RANGE_DAYS (90) days per export, so longer ranges are
-downloaded in pieces (kept in <SUBDIR>/parts/) and combined into one file.
+back by the decision look-back (default 3 months; --lookback-months or
+DECISION_LOOKBACK_MONTHS in credentials.env), because a credit decision is usually
+made weeks before the facility is approved. The number of pieces follows from the
+resulting range.
+The ERP accepts at most ERP_MAX_RANGE_DAYS (90) days per export, From and To both
+counted, but its PHP export also stops after 360 s ("Maximum execution time ...
+exceeded") and then returns an HTML error page saved as .xlsx. So ranges are
+downloaded in pieces of ERP_PIECE_DAYS (default 15, never above ERP_MAX_RANGE_DAYS),
+kept in <SUBDIR>/parts/ and combined into one file. Each piece is checked as soon as
+it downloads: a piece that timed out on the server is split in half and downloaded
+again (down to ERP_MIN_PIECE_DAYS); a piece that returns nothing within
+ERP_DOWNLOAD_TIMEOUT restarts Firefox (cancelling the stuck download) and is split the
+same way; any other error page is retried, then stops the run and logs its text.
+Pieces after the first reuse the open report screen (only the dates change).
 Exit code: 0 on success, 1 on any failure (so the orchestrator can stop).
 """
 import os
+import re
 import sys
 import time
 import argparse
@@ -44,9 +56,22 @@ ERP_PASSWORD = os.environ.get('ERP_PASSWORD')
 ERP_URL = os.environ.get('ERP_URL')
 
 # Months of decisions to pull before the reporting period start (override in credentials.env)
-DECISION_LOOKBACK_MONTHS = int(os.environ.get('DECISION_LOOKBACK_MONTHS', '2'))
+DEFAULT_DECISION_LOOKBACK_MONTHS = 3
+DECISION_LOOKBACK_MONTHS = int(os.environ.get('DECISION_LOOKBACK_MONTHS',
+                                              str(DEFAULT_DECISION_LOOKBACK_MONTHS)))
 # Longest From-To range the ERP report screen accepts (days, both ends inclusive)
 ERP_MAX_RANGE_DAYS = int(os.environ.get('ERP_MAX_RANGE_DAYS', '90'))
+# Days per download piece: small enough for the ERP to build the .xlsx within its
+# 360 s PHP limit. Pieces that still time out are halved, down to ERP_MIN_PIECE_DAYS.
+ERP_PIECE_DAYS = min(int(os.environ.get('ERP_PIECE_DAYS', '15')), ERP_MAX_RANGE_DAYS)
+ERP_MIN_PIECE_DAYS = max(int(os.environ.get('ERP_MIN_PIECE_DAYS', '1')), 1)
+# Retries for a piece that comes back as an error page other than the timeout
+ERP_PIECE_RETRIES = int(os.environ.get('ERP_PIECE_RETRIES', '1'))
+# Seconds to wait for a piece's file to appear; a piece with no file by then is treated
+# like a server timeout (Firefox restarted, piece split in half)
+ERP_DOWNLOAD_TIMEOUT = int(os.environ.get('ERP_DOWNLOAD_TIMEOUT', '600'))
+# Seconds to wait for the report screen's dropdowns to load
+ERP_SCREEN_TIMEOUT = int(os.environ.get('ERP_SCREEN_TIMEOUT', '30'))
 
 REPORTS = {
     "credit-score": {
@@ -127,28 +152,40 @@ def click_reports(driver):
         raise
 
 
-def switch_to_iframe_with(driver, element_ids):
-    """Switch into the first iframe containing all element_ids (or stay on the main page)."""
-    time.sleep(2)
+def _find_in_frames(driver, element_ids):
+    """One pass: switch into the first iframe (or the main page) holding all element_ids."""
+    driver.switch_to.default_content()
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    log.info(f"Found {len(iframes)} iframe(s)")
     for index, iframe in enumerate(iframes):
         try:
             driver.switch_to.frame(iframe)
             for el in element_ids:
                 driver.find_element(By.ID, el)
-            log.info(f"Found {element_ids} inside iframe index {index}")
-            return True
-        except NoSuchElementException:
+            return f"iframe index {index} (of {len(iframes)})"
+        except Exception:
             driver.switch_to.default_content()
     try:
         for el in element_ids:
             driver.find_element(By.ID, el)
-        log.info(f"Found {element_ids} on main page")
-        return True
+        return f"main page ({len(iframes)} iframe(s))"
     except NoSuchElementException:
-        log.error(f"Could not find {element_ids} in any iframe or main page.")
-        return False
+        return None
+
+
+def switch_to_iframe_with(driver, element_ids, timeout=None):
+    """Poll until element_ids are found in an iframe or the main page (slow ERP pages)."""
+    timeout = ERP_SCREEN_TIMEOUT if timeout is None else timeout
+    deadline = time.time() + timeout
+    time.sleep(1)
+    while True:
+        where = _find_in_frames(driver, element_ids)
+        if where:
+            log.info(f"Found {element_ids} in {where}")
+            return True
+        if time.time() >= deadline:
+            log.error(f"Could not find {element_ids} in any iframe or main page within {timeout}s.")
+            return False
+        time.sleep(1)
 
 
 def select_dropdown(driver, element_id, visible_text):
@@ -160,14 +197,15 @@ def select_dropdown(driver, element_id, visible_text):
         raise
 
 
-def get_date_range():
-    """Reporting period widened back to the 1st of the month DECISION_LOOKBACK_MONTHS earlier."""
+def get_date_range(lookback_months=None):
+    """Reporting period widened back to the 1st of the month `lookback_months` earlier."""
+    lookback = DECISION_LOOKBACK_MONTHS if lookback_months is None else lookback_months
     start, end = get_period(get_mode())
-    start = (start - relativedelta(months=DECISION_LOOKBACK_MONTHS)).replace(day=1)
+    start = (start - relativedelta(months=lookback)).replace(day=1)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
-def date_chunks(start, end, max_days=ERP_MAX_RANGE_DAYS):
+def date_chunks(start, end, max_days=ERP_PIECE_DAYS):
     """Split start..end (dates, inclusive) into consecutive pieces of at most max_days days."""
     pieces = []
     while start <= end:
@@ -175,6 +213,46 @@ def date_chunks(start, end, max_days=ERP_MAX_RANGE_DAYS):
         pieces.append((start, stop))
         start = stop + timedelta(days=1)
     return pieces
+
+
+class ERPExportError(RuntimeError):
+    """The ERP returned an error page (saved as .xlsx) instead of a workbook."""
+
+
+class ERPServerTimeout(ERPExportError):
+    """The ERP's PHP export hit its maximum execution time; a smaller range may work."""
+
+
+class DownloadTimeout(TimeoutError):
+    """No file arrived for a piece within the wait time."""
+
+
+XLSX_SIGNATURE = b"PK\x03\x04"      # .xlsx is a zip archive
+TIMEOUT_PATTERNS = ("maximum execution time", "max_execution_time")
+
+
+def error_page_text(raw_bytes, limit=300):
+    """Readable text of an HTML/PHP error page: tags removed, whitespace collapsed."""
+    text = raw_bytes.decode("utf-8", "replace")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def check_piece(path):
+    """Raise ERPServerTimeout / ERPExportError if the downloaded piece is not a real .xlsx."""
+    raw_bytes = Path(path).read_bytes()
+    if raw_bytes[:4] == XLSX_SIGNATURE:
+        return
+    text = error_page_text(raw_bytes)
+    if any(p in text.lower() for p in TIMEOUT_PATTERNS):
+        raise ERPServerTimeout(text)
+    raise ERPExportError(text or f"{len(raw_bytes)} bytes, not an Excel file")
+
+
+def split_piece(a, b):
+    """Two halves of a..b (inclusive)."""
+    mid = a + timedelta(days=((b - a).days + 1) // 2 - 1)
+    return (a, mid), (mid + timedelta(days=1), b)
 
 
 def _header_index(raw):
@@ -287,56 +365,183 @@ def wait_for_download(download_dir, before, timeout=600, poll_interval=5):
             last_size = size
         time.sleep(poll_interval)
         elapsed += poll_interval
-    raise TimeoutError(f"Download did not complete within {timeout}s "
-                       f"(check {download_dir} for a .part file).")
+    pending = sorted(f for f in set(os.listdir(download_dir)) - before)
+    raise DownloadTimeout(f"no file within {timeout}s; new items in the download folder: "
+                          f"{', '.join(pending) or 'none'}")
 
 
-def run(report_key):
-    cfg = REPORTS[report_key]
-    data_dir = BASE_DIR / "data" / cfg["subdir"]
-    data_dir.mkdir(parents=True, exist_ok=True)
+def set_piece_dates(driver, report_name, a, b, first):
+    """
+    Set From/To for a piece. Pieces after the first stay on the open report screen
+    and only change the dates; if that screen is gone, re-open it once and retry.
+    """
+    try:
+        set_date(driver, "search_from_date", a.strftime("%Y-%m-%d"))
+        set_date(driver, "search_to_date", b.strftime("%Y-%m-%d"))
+    except Exception as e:
+        if first:
+            raise
+        log.warning(f"Report screen not available for the next piece ({e.__class__.__name__}); "
+                    f"re-opening it")
+        open_report_screen(driver, report_name, refresh=True)
+        set_date(driver, "search_from_date", a.strftime("%Y-%m-%d"))
+        set_date(driver, "search_to_date", b.strftime("%Y-%m-%d"))
 
+
+def check_credentials():
     missing = [k for k, v in (("ERP_URL", ERP_URL), ("ERP_USERNAME", ERP_USERNAME),
                               ("ERP_PASSWORD", ERP_PASSWORD)) if not v]
     if missing:
         raise EnvironmentError(f"Missing in credentials.env: {', '.join(missing)}")
 
-    from_date, to_date = get_date_range()
+
+def start_firefox(data_dir):
+    """New Firefox, logged in to the ERP."""
+    log.info(f"Starting Firefox (download folder: {data_dir})")
+    driver = setup_firefox_driver(data_dir)
+    login(driver, ERP_USERNAME, ERP_PASSWORD)
+    dismiss_firefox_update_dialog(UPDATE_IMG, DISMISS_IMG, timeout=15, confidence=0.8)
+    return driver
+
+
+def open_report_screen_with_retry(driver, report_name):
+    try:
+        open_report_screen(driver, report_name)
+    except Exception as e:
+        log.warning(f"Report screen did not open ({e}); refreshing and trying once more")
+        open_report_screen(driver, report_name, refresh=True)
+
+
+def download_piece(driver, cfg, a, b, n, data_dir, parts_dir, today):
+    """
+    Export one date piece and check it. Returns the saved part file.
+    Raises:
+      DownloadTimeout   no file arrived (Firefox is closed here so the stuck download stops)
+      ERPServerTimeout  the ERP returned its "maximum execution time" error page
+      ERPExportError    the ERP returned another error page
+    Error pages are kept as parts/*.error.html.
+    """
+    before_files = set(os.listdir(data_dir))
+    t0 = time.time()
+    export_to_excel(driver)
+    log.info(f"Waiting for the export to finish downloading (timeout {ERP_DOWNLOAD_TIMEOUT}s)")
+    try:
+        downloaded_file = Path(wait_for_download(data_dir, before_files,
+                                                 timeout=ERP_DOWNLOAD_TIMEOUT))
+    except DownloadTimeout as e:
+        shot = parts_dir / f"{cfg['prefix']}_{today}_part{n}_{a}_to_{b}_no_download.png"
+        try:
+            driver.save_screenshot(str(shot))
+            log.warning(f"Screenshot of the ERP screen: {shot.name}")
+        except Exception:
+            pass
+        log.warning(f"Piece {a} to {b}: {e}")
+        # Close Firefox so a late-arriving file can't be taken for the next piece
+        driver.quit()
+        log.info("Firefox closed (stuck download cancelled)")
+        for f in set(os.listdir(data_dir)) - before_files:
+            try:
+                (data_dir / f).unlink()
+                log.info(f"Removed leftover {f}")
+            except OSError:
+                pass
+        raise
+
+    part = parts_dir / f"{cfg['prefix']}_{today}_part{n}_{a}_to_{b}{downloaded_file.suffix}"
+    downloaded_file.replace(part)
+    size = part.stat().st_size
+    try:
+        check_piece(part)
+    except ERPExportError as e:
+        bad = part.with_suffix(".error.html")
+        part.replace(bad)
+        e.details = f"{size:,} bytes after {time.time() - t0:.0f}s, kept as {bad.name}"
+        e.bad_file = bad
+        raise
+    log.info(f"Piece {n} saved: {part.name} ({size:,} bytes, {time.time() - t0:.0f}s)")
+    return part
+
+
+def split_or_fail(queue, a, b, error):
+    """Put the two halves of a..b at the front of the queue, or stop if it can't shrink."""
+    days = (b - a).days + 1
+    if days <= ERP_MIN_PIECE_DAYS:
+        raise type(error)(f"{a} to {b} still fails at {days} day(s) "
+                          f"(ERP_MIN_PIECE_DAYS={ERP_MIN_PIECE_DAYS}): {error}") from None
+    halves = split_piece(a, b)
+    queue[:0] = list(halves)
+    log.info("Splitting into " + " and ".join(f"{x} to {y}" for x, y in halves))
+
+
+def run(report_key, lookback_months=None):
+    """
+    1. Work out the date range and cut it into pieces (ERP_PIECE_DAYS each)
+    2. Log in once, then download the pieces one by one on the same report screen:
+         good file           -> keep it
+         nothing arrives     -> restart Firefox, split the piece in half
+         ERP timeout page    -> split the piece in half
+         other error page    -> retry (ERP_PIECE_RETRIES), then stop
+    3. Combine the pieces into <PREFIX>_<today>.xlsx
+    """
+    cfg = REPORTS[report_key]
+    data_dir = BASE_DIR / "data" / cfg["subdir"]
+    parts_dir = data_dir / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    check_credentials()
+
+    # 1. Date range and pieces
+    lookback = DECISION_LOOKBACK_MONTHS if lookback_months is None else lookback_months
+    from_date, to_date = get_date_range(lookback)
     start = datetime.strptime(from_date, "%Y-%m-%d").date()
     end = datetime.strptime(to_date, "%Y-%m-%d").date()
     pieces = date_chunks(start, end)
     log.info(f"{cfg['report_name']}: {from_date} to {to_date} "
-             f"(mode {get_mode()}, +{DECISION_LOOKBACK_MONTHS} month(s) look-back) | "
-             f"{len(pieces)} piece(s) of at most {ERP_MAX_RANGE_DAYS} days: "
+             f"(mode {get_mode()}, +{lookback} month(s) look-back) | "
+             f"{len(pieces)} piece(s) of at most {ERP_PIECE_DAYS} days: "
              + ", ".join(f"{a} to {b}" for a, b in pieces))
 
-    parts_dir = data_dir / "parts"
-    parts_dir.mkdir(exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     t0 = time.time()
-    log.info(f"Starting Firefox (download folder: {data_dir})")
-    driver = setup_firefox_driver(data_dir)
+    driver = None
     try:
-        login(driver, ERP_USERNAME, ERP_PASSWORD)
-        dismiss_firefox_update_dialog(UPDATE_IMG, DISMISS_IMG, timeout=15, confidence=0.8)
+        # 2. Download the pieces
+        driver = start_firefox(data_dir)
+        need_screen = True            # open the report screen before the next piece
+        queue = list(pieces)          # chronological; halves of a failed piece go to the front
+        parts, retries, n = [], {}, 0
+        while queue:
+            a, b = queue.pop(0)
+            n += 1
+            log.info(f"Piece {n} ({len(queue)} more queued): {a} to {b} ({(b - a).days + 1} days)")
+            if need_screen:
+                open_report_screen_with_retry(driver, cfg["report_name"])
+            set_piece_dates(driver, cfg["report_name"], a, b, first=need_screen)
+            need_screen = False
 
-        parts = []
-        for i, (a, b) in enumerate(pieces, start=1):
-            log.info(f"Piece {i} of {len(pieces)}: {a} to {b}")
-            open_report_screen(driver, cfg["report_name"], refresh=i > 1)
-            set_date(driver, "search_from_date", a.strftime("%Y-%m-%d"))
-            set_date(driver, "search_to_date", b.strftime("%Y-%m-%d"))
+            try:
+                parts.append(download_piece(driver, cfg, a, b, n, data_dir, parts_dir, today))
+                time.sleep(2)
+            except DownloadTimeout as e:              # nothing arrived
+                driver = None                         # closed in download_piece
+                split_or_fail(queue, a, b, e)
+                driver = start_firefox(data_dir)
+                need_screen = True
+            except ERPServerTimeout as e:             # ERP gave up (360 s limit)
+                log.warning(f"Piece {a} to {b}: ERP timed out ({e.details}): {str(e)[:150]}")
+                split_or_fail(queue, a, b, e)
+                time.sleep(2)
+            except ERPExportError as e:               # any other error page
+                tries = retries.get((a, b), 0)
+                if tries >= ERP_PIECE_RETRIES:
+                    raise ERPExportError(f"{a} to {b}: ERP returned an error page instead of "
+                                         f"Excel (see {e.bad_file}): {e}") from None
+                retries[(a, b)] = tries + 1
+                queue.insert(0, (a, b))
+                log.warning(f"Piece {a} to {b}: ERP returned an error page ({e.details}); "
+                            f"retry {tries + 1} of {ERP_PIECE_RETRIES}: {e}")
+                time.sleep(5)
 
-            before_files = set(os.listdir(data_dir))
-            export_to_excel(driver)
-            log.info("Waiting for the export to finish downloading (timeout 600s)")
-            downloaded_file = Path(wait_for_download(data_dir, before_files, timeout=600))
-            part = parts_dir / f"{cfg['prefix']}_{today}_part{i}_{a}_to_{b}{downloaded_file.suffix}"
-            downloaded_file.replace(part)
-            log.info(f"Piece {i} saved: {part.name} ({part.stat().st_size:,} bytes)")
-            parts.append(part)
-            time.sleep(2)
-
+        # 3. One file for the summary scripts
         renamed_path = data_dir / f"{cfg['prefix']}_{today}.xlsx"
         if len(parts) == 1:
             parts[0].replace(renamed_path)
@@ -346,16 +551,23 @@ def run(report_key):
                  f"({renamed_path.stat().st_size:,} bytes, {time.time() - t0:.0f}s)")
         return renamed_path
     finally:
-        driver.quit()
-        log.info("Firefox closed")
+        if driver is not None:
+            driver.quit()
+            log.info("Firefox closed")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Download a SmartOps ERP decision report")
     ap.add_argument("--report", required=True, choices=sorted(REPORTS))
+    ap.add_argument("--lookback-months", type=int,
+                    help=f"months of decisions before the period start (default "
+                         f"{DECISION_LOOKBACK_MONTHS}: DECISION_LOOKBACK_MONTHS or "
+                         f"{DEFAULT_DECISION_LOOKBACK_MONTHS})")
     args = ap.parse_args()
     try:
-        run(args.report)
+        if args.lookback_months is not None and args.lookback_months < 0:
+            raise ValueError("--lookback-months must be 0 or more")
+        run(args.report, args.lookback_months)
     except Exception as e:
         log.error(f"{REPORTS[args.report]['report_name']} download failed: {e}", exc_info=True)
         sys.exit(1)
