@@ -39,6 +39,7 @@ import argparse
 import logging
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -248,11 +249,12 @@ def run_rental_dpd(args):
     log.info(f"{name} | {mode_text} | skip-download={args.skip_download} "
              f"| no-emails={args.no_emails}")
 
-    # Child scripts see first activation day .. end of the data month as a custom period:
-    # decisions are pulled from 3 months (look-back) before it, and the history covers
-    # the activations plus the 12-month Existing look-back.
+    # Child scripts see first activation day .. run date (1st after the data month) as a
+    # custom period: decisions are pulled from 3 months (look-back) before it, and the
+    # history reaches the run date for the Existing test "open on the run date".
+    run_date = as_at + timedelta(days=1)
     env = dict(os.environ, REPORT_MODE="custom", REPORT_N_MONTHS=str(rds.ACTIVATION_MONTHS),
-               REPORT_FROM_DATE=start.isoformat(), REPORT_TO_DATE=as_at.isoformat(),
+               REPORT_FROM_DATE=start.isoformat(), REPORT_TO_DATE=run_date.isoformat(),
                EXISTING_LOOKBACK_MONTHS=str(rds.rss.RENTAL_LOOKBACK_MONTHS),
                PYTHONIOENCODING="utf-8")
     steps = [STEP_CREDIT_SCORE, STEP_RBP, STEP_BDO_HISTORY,

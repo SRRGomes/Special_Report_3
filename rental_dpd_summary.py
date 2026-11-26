@@ -14,7 +14,8 @@ HOW IT WORKS (main() follows these steps)
                  window (else the history file), BDO history (Existing/New), DPD file
   3. Activations facilities disbursed in the window (CONEX_DATE)
   4. Decisions   Credit Score first, then RBP, else Manual
-  5. Categories  Product (AF / 3W / 2W), segment, Existing / New (v2 rule, as at end of A)
+  5. Categories  Product (AF / 3W / 2W), segment, Existing / New (v2 rule: another facility
+                 open on the run date (1st), or taken in the 12 months before CONEX_DATE)
   6. LENDING     COLLECTION_FOR_THE_MONTH + DUE_FOR_THE_MONTH summed over the 12 month-ends
                  up to A: parquet in LENDING_data/lending_base first, then csv for the rest
                  (each csv month is saved as parquet for next time)
@@ -545,7 +546,8 @@ def prepare(files, lending_dir, as_at_month):
     df["PRODUCT_SEGMENT"] = [categorize_segment(p, s) for p, s in
                              zip(df["PRODUCT_NAME"], df["SCHEME_DESCRIPTION"])]
     log.info(f"Product Category: {df['PRODUCT_CATEGORY'].value_counts().to_dict()}")
-    df = classify_customers_v2(df, files["HISTORY"], as_at)
+    run_date = as_at + pd.Timedelta(days=1)                # 1st of the run month
+    df = classify_customers_v2(df, files["HISTORY"], run_date)
 
     # 6. LENDING: collection / due summed over the 12 month-ends
     lending, lmonths = load_lending_dpd(lending_dir, as_at_month)

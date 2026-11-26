@@ -14,7 +14,8 @@ HOW IT WORKS (main() follows these steps)
                  BRANCH DISBURSEMENT OLD per month (else that month from the history file)
   3. Cohorts     facilities disbursed in each month (= activation month)
   4. Decisions   Credit Score first, then RBP, else Manual
-  5. Categories  Product (AF / 3W / 2W), segment, Existing / New (v2 rule, as at the last day)
+  5. Categories  Product (AF / 3W / 2W), segment, Existing / New (v2 rule: another facility
+                 open on the run date, or taken in the 12 months before CONEX_DATE)
   6. LENDING     merge each cohort with THE SAME MONTH's portfolio (NEW_CONNO = FACNO)
   7. Metrics     per product / customer type / segment / decision and month:
                    No. = facilities, Value = sum LEASE_AMOUNT,
@@ -100,8 +101,8 @@ def customer_rule_text(as_at):
     """v2 Existing/New rule, worded as tests A and B (PDF note and Excel sheets)."""
     return (f"Existing Customer if another facility of the same client code passes A or B "
             f"(else New). A: open on the as-at date ({ordinal_date(as_at)}). "
-            f"B: disbursed before this facility's CONEX_DATE and open at some point in the "
-            f"{RENTAL_LOOKBACK_MONTHS} months before it.")
+            f"B: disbursed in the {RENTAL_LOOKBACK_MONTHS} months before this facility's "
+            f"CONEX_DATE.")
 
 # ============================================================
 # LENDING PORTFOLIOS
@@ -294,11 +295,13 @@ def cohort_history_frame(cohorts):
 def classify_customers_v2(df, history_file, as_at):
     """
     Existing if another facility of the same client code
-      (A) is active as at the report's as-at date:
+      (A) is open on the run date (as_at):
           disbursed on/before as_at and not closed before it, OR
-      (B) was active in the RENTAL_LOOKBACK_MONTHS before this facility's CONEX_DATE:
-          disbursed before CONEX_DATE and not closed before CONEX_DATE - look-back.
+      (B) was taken in the RENTAL_LOOKBACK_MONTHS before this facility's CONEX_DATE:
+          CONEX_DATE - look-back <= its disbursement date < CONEX_DATE (open or closed).
     Else New. No client code -> UNCLASSIFIED.
+    Test A needs every facility that can still be open on as_at, however old, hence
+    the long BDO history (HISTORY_MAX_TENOR_MONTHS).
     """
     df = df.copy()
     as_at = pd.Timestamp(as_at)
@@ -309,13 +312,13 @@ def classify_customers_v2(df, history_file, as_at):
         need_from = df[BDO_START_COL].min() - pd.DateOffset(months=RENTAL_LOOKBACK_MONTHS)
         if r:
             log.info(f"Customer history range {r[0]:%d-%b-%Y} to {r[1]:%d-%b-%Y} | needed: "
-                     f"from {need_from:%d-%b-%Y} (12-month look-back) to {as_at:%d-%b-%Y} (as at)")
+                     f"from {need_from:%d-%b-%Y} (12-month look-back) to {as_at:%d-%b-%Y} (run date)")
             if r[0] > need_from:
                 log.warning("Customer history starts after the 12-month look-back: "
                             "Existing Customers will be under-counted.")
             if r[1] < as_at:
-                log.warning("Customer history ends before the as-at date: facilities opened "
-                            "after it are not seen for 'active as at'.")
+                log.warning("Customer history ends before the run date: facilities opened "
+                            "after it are not seen for 'open on the run date'.")
     else:
         log.warning(f"No {BDO_PREFIX} history file: Existing is checked against these 3 "
                     f"cohorts only, so it will be under-counted.")
@@ -330,14 +333,14 @@ def classify_customers_v2(df, history_file, as_at):
     m = m[m["_HKEY"] != m["_KEY"]]
     active_as_at = (m["_HSTART"] <= as_at) & (m["_HCLOSE"].isna() | (m["_HCLOSE"] > as_at))
     window_start = m["_CONEX"] - pd.DateOffset(months=RENTAL_LOOKBACK_MONTHS)
-    in_lookback = ((m["_HSTART"] < m["_CONEX"])
-                   & (m["_HCLOSE"].isna() | (m["_HCLOSE"] >= window_start)))
+    in_lookback = (m["_HSTART"] < m["_CONEX"]) & (m["_HSTART"] >= window_start)
     existing = set(m.loc[active_as_at | in_lookback, "_KEY"])
     keys_a = set(m.loc[active_as_at, "_KEY"])
     keys_b = set(m.loc[in_lookback, "_KEY"])
-    log.info(f"Existing via 'active as at {as_at:%d-%b-%Y}': "
-             f"{m.loc[active_as_at, '_KEY'].nunique():,} | via '{RENTAL_LOOKBACK_MONTHS} months "
-             f"before CONEX': {m.loc[in_lookback, '_KEY'].nunique():,} (a facility can be both)")
+    log.info(f"Existing via A 'open on {as_at:%d-%b-%Y}': "
+             f"{m.loc[active_as_at, '_KEY'].nunique():,} | via B 'taken in the "
+             f"{RENTAL_LOOKBACK_MONTHS} months before CONEX': "
+             f"{m.loc[in_lookback, '_KEY'].nunique():,} (a facility can be both)")
 
     df["CLIENT_CODE"] = cust.values
     # Which test made the facility Existing: "A+B", "A", "B" ("" for New / N/A)
